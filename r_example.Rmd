@@ -1,0 +1,1061 @@
+---
+title: "Coursework 2 - Generalised Linear Mixed Models: Application to country level data"
+author: "Sam Husbands"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    code_download: yes
+    code_folding: hide
+    fig_caption: yes
+  pdf_document:
+    keep_tex: yes
+    number_sections: no
+    fig_caption: yes
+  word_document:
+    toc: yes
+always_allow_html: yes
+header-includes:
+- \usepackage{caption}
+- \captionsetup[figure]{labelformat=empty}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+
+```{r libraries,echo= FALSE}
+# include your libraries here
+# use echo = FALSE if you do not want the Code button to appear
+library(MuMIn)
+library(tidyverse) 
+library(knitr) # general purpose literate programming tools
+library(klippy) # to copy chunks of code to clipboard
+library(patchwork)
+library(broom)
+library(kableExtra)
+library(modelr)
+library(mgcv)
+library(ggpubr)
+library(pander)
+library(effects)
+library(readxl)
+library(janitor)
+library(caret)
+library(lme4)
+library(MASS)
+library(lmerTest)
+library(cAIC4)
+
+#nb: go through and remove superfluous packages at end
+```
+
+#  Q1. To what extent is higher GDP per capita associated with lower infant mortality?
+
+## Introduction
+
+This question is motivated by the interest in what drives lower infant mortality. It is expected that increasing GDP per capita will reduce infant mortality, as economic development is likely to improve health infrastructure and be associated with factors that directly reduce the number of children dying, even after controlling for potential confounding variables such as life expectancy and years of education.
+
+```{r q1 - Loading the Dataset}
+#reading the data
+sdg <- read_csv("sdg.csv")
+write.csv(sdg, "C:\\Users\\Sam\\Documents\\Masters_Modules\\Applied Statistics\\CW2\\sdg.csv", row.names = FALSE)
+
+#converting categorical data to factors (from characters)
+sdg <- sdg %>% 
+        mutate(country = as.factor(country),
+               continent = as.factor(continent),
+               region = as.factor(region))
+
+sdg$income_class <- factor(sdg$income_class,
+                           levels = c("L", "LM", "UM", "H"))
+```
+
+## Data Exploration
+
+### Missing Data
+
+Before beginning any exploratory analysis, first we must handle the issue of missing data. It can be seen that there is some missing data for the variables life expectancy and infant mortality rate. As there is a limited amount of missing data, this analysis is restricted to complete case analysis, where only data with no missing values is considered. After applying this complete case restriction, the number of data points has fallen from 268 to 259.
+
+```{r q1 - Considering missing values}
+#checking to see how many missing values we have by variable
+filter_df <-colSums(is.na(sdg)) %>% as.matrix() %>% 
+                as.data.frame()
+
+#presenting the missing data by variable
+kbl(subset(filter_df, V1>0), booktabs = T, 
+    caption = "Missing Data by Variable",
+    col.names = c("Missing Data")) %>% 
+  kable_styling(latex_options = c("striped", "HOLD_position"))
+#dropping the missing values
+sdg <- sdg[complete.cases(sdg), ]
+```
+
+It is also worth noting that this dataset is imbalanced, meaning the number of observations is not equal across countries. This analysis did not restrict itself to only those countries with all 5 observations, as this would no longer be a representative sample and all the following analysis is applicable to imbalanced data. However, there will be more uncertainty in estimates for countries with fewer observations.
+
+```{r q1 - Data points by country}
+#getting a count of countries by how many times they occur
+missing_countries <- sdg %>% 
+                      group_by(country) %>% 
+                      summarise(n = n())
+#decided not to include the below code due to space constraints
+#kbl(head(missing_countries, 10), booktabs = T, 
+#    caption = "Data Points per Country; first 10 rows",
+#    col.names = c("Country", "Data Points")) %>% 
+#  kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+
+
+### Explanatory Plots
+
+```{r q1 - Explanatory Plots 1}
+
+gdp_fig_1 <- sdg %>% 
+              ggplot(aes(x = (gdp/1000),
+                         y = infant_mortality_rate)) +
+              geom_smooth(formula = y ~ x, method = 'loess') +
+              geom_point(color = "darkblue", alpha = 0.5) +
+              xlab("") +
+              ylab("") +
+              ggtitle("Normal Scale")
+
+gdp_fig_2 <- sdg %>% 
+              ggplot(aes(x = (gdp/1000),
+                         y = infant_mortality_rate)) +
+              scale_x_continuous(trans = "log") +
+              geom_smooth(formula = y ~ x, method = 'loess') +
+              geom_point(color = "darkblue", alpha = 0.5) +
+              xlab("") +
+              ylab("") +
+              ggtitle("Log Scale")
+  
+
+gdp_fig_3<- sdg %>% 
+              ggplot(aes(x = (gdp/1000),
+                         y = infant_mortality_rate)) +
+              scale_x_continuous(trans = "sqrt") +
+              geom_smooth(formula = y ~ x, method = 'loess') +
+              geom_point(color = "darkblue", alpha = 0.5) +
+              xlab("") +
+              ylab("")  +
+              ggtitle("Square Root Scale")
+
+gdp_figure <- ggarrange(gdp_fig_1, gdp_fig_2, gdp_fig_3,
+          ncol = 2, nrow = 2)
+
+
+annotate_figure(gdp_figure,
+                top = text_grob("Association between GDP and Infant Mortality",
+                                just = "centre"),
+                left = text_grob("Infant Mortality Rate", rot = 90),
+                bottom = text_grob("GDP per Capita ($1000)"))
+```
+
+The first set of explanatory plots reveals that there is a negative association between GDP per capita and the infant mortality rate. The plot also reveals this relationship is non-linear, in that increases in GDP per capita when GDP is small have a larger negative effect on infant mortality than when GDP is already large. It is also notable that in the log scale, there is a more linear relationship implying that a log transformation will be beneficial when estimating a linear model.
+
+```{r q1 - Explanatory Plots 2}
+
+#creating quartiles for each continuous variable
+le_quartiles <- quantile(sdg$life_expectancy)
+le_quartiles[1]<--Inf
+le_quartiles[5]<-Inf
+le_quartiles <- le_quartiles[-3]
+
+ye_quartiles <- quantile(sdg$years_education)
+ye_quartiles[1]<--Inf
+ye_quartiles[5]<-Inf
+ye_quartiles <- ye_quartiles[-3]
+
+sdg <- sdg %>% 
+          mutate(le_bins = cut(life_expectancy, 
+                               breaks = le_quartiles),
+                 ye_bins = cut(years_education, 
+                               breaks = ye_quartiles))
+
+levels(sdg$le_bins) <- c("Bottom 25%", "Middle 50%", "Top 25%")
+levels(sdg$ye_bins) <- c("Bottom 25%", "Middle 50%", "Top 25%")
+
+#making plots
+income_class_fig <- sdg %>% 
+                      ggplot(aes(x = (gdp/1000),
+                                 y = infant_mortality_rate,
+                                 col = income_class)) +
+                      scale_x_continuous(trans = "log", breaks =c(1, 7.4, 54.6)) +
+                      geom_point(alpha = 0.5) +
+                      geom_smooth(formula = y ~ x, method = 'loess') +               
+                      xlab("") +
+                      ylab("") +
+                      labs(color='Income Class') +
+                      scale_color_brewer(type = "qual", palette = "Dark2")
+
+continent_fig <- sdg %>% 
+                  ggplot(aes(x = (gdp/1000),
+                             y = infant_mortality_rate,
+                             col = continent)) +
+                  scale_x_continuous(trans = "log", breaks =c(1, 7.4, 54.6)) +
+                  geom_point(alpha = 0.5) +
+                  geom_smooth(formula = y ~ x, method = 'loess') +               
+                  xlab("") +
+                  ylab("") +
+                  labs(color='Continent')  +
+                  scale_color_brewer(type = "qual", palette = "Dark2")
+le_fig <- sdg %>% 
+              ggplot(aes(x = (gdp/1000),
+                         y = infant_mortality_rate,
+                         col = le_bins)) +
+              scale_x_continuous(trans = "log", breaks =c(1, 7.4, 54.6)) +
+              geom_point(alpha = 0.5) +
+              geom_smooth(formula = y ~ x, method = 'loess') +               
+              xlab("") +
+              ylab("") +
+              labs(color='Life Expectancy')  +
+              scale_color_brewer(type = "qual", palette = "Dark2")
+
+ye_fig <- sdg %>% 
+              ggplot(aes(x = (gdp/1000),
+                         y = infant_mortality_rate,
+                         col = ye_bins)) +
+              scale_x_continuous(trans = "log", breaks =c(1, 7.4, 54.6)) +
+              geom_point(alpha = 0.5) +
+              geom_smooth(formula = y ~ x, method = 'loess') +               
+              xlab("") +
+              ylab("") +
+              labs(color='Years Education') +
+              scale_color_brewer(type = "qual", palette = "Dark2")
+
+gdp_figure <- ggarrange(income_class_fig, continent_fig, 
+                        ye_fig, le_fig, ncol = 2, nrow = 2)
+
+
+annotate_figure(gdp_figure,
+                top = text_grob("Association between GDP and Infant Mortality Across Categories",
+                                just = "centre"),
+                left = text_grob("Infant Mortality Rate", rot = 90),
+                bottom = text_grob("GDP per Capita ($1000): Log Scale"))
+
+```
+
+Equally, it appears that other variables, such as the region, the life expectancy, the average years of education and the income class all have an effect on the association between GDP per capita and infant mortality. Countries in Africa have a stronger association, and countries with higher levels of average years of education and life expectancy show a less substantive negative relationship. Overall, it appears that the effect of GDP per capita is contingent on the level of other variables, meaning interactions will need to be considered.
+
+## Model Building
+
+```{r q1 - Centreing Variables}
+#adding a centred version of each of the numerical variables
+#mean(sdg$gdp)
+#mean(sdg$life_expectancy)
+#mean(sdg$years_education)
+sdg <- sdg %>% 
+        mutate(gdp_c = gdp - 22900,
+               life_exp_c = life_expectancy - 76,
+               years_edu_c = years_education - 10,
+               year_c = year - 2015)
+```
+
+After performing the explanatory plots, the continuous variables were centred to improved the interpret ability of future random effects. From explanatory analysis, it was clear that interactions between the different variables were needed. To find the best model from the set of candidate predictors, I performed an exhaustive search of all the different models nested within the model below and chose the best model by it's Akaike information criterion. AIC is a means of model selection between models with different variables, and trades off between goodness of fit and the number of parameters estimated. 
+
+$$E[\mbox{infant mortality rate}|\mbox{gdp, years education, life expectancy, year, income class, region}] =$$ $$\alpha_0 + \alpha_1 \mbox{gdp} + \alpha_2\, \mbox{years education} +  \alpha_3\, \mbox{life expectancy} +  \alpha_4\, \mbox{year} +\vec\beta\, \mbox{income class} + \vec\gamma \mbox{region}\ +$$ $$ \delta_1\ \mbox{gdp*life expectancy} + \delta_2\ \mbox{gdp*years education} + \delta_3\ \mbox{gdp*year} +  \vec\epsilon \mbox{gdp*income class} + \vec\zeta \mbox{gdp*region} $$
+
+
+```{r q1 - Best Linear Model}
+options(na.action = "na.fail")
+global_linear_model <- lm(infant_mortality_rate ~ gdp_c + years_edu_c + 
+                                                  life_exp_c + income_class +
+                                                  year_c + continent +
+                                                  gdp_c: years_edu_c +
+                                                  gdp_c: life_exp_c +
+                                                  gdp_c: income_class +
+                                                  gdp_c: year_c +
+                                                  gdp_c: continent,
+                                                  data = sdg )
+#creates a linear model with main effects and all two way interactions
+combinations <- dredge(global_linear_model, rank = AIC)
+#coefTable(combinations[1])
+best_linear_model <- lm(infant_mortality_rate ~ gdp_c + years_edu_c + 
+                        life_exp_c + income_class + year_c + region + 
+                        gdp_c:years_edu_c + gdp_c:life_exp_c + 
+                        gdp_c:region, data = sdg)
+coefs_blm <- tidy(best_linear_model)
+```
+```{r q1 - Best Linear Log Model}
+#conversion to log gdp
+sdg <- sdg %>% mutate(ln_gdp = log(gdp))
+sdg <- sdg %>% mutate(ln_gdp_c = ln_gdp - mean(sdg$ln_gdp))
+global_linear_log_model <- lm(infant_mortality_rate ~ ln_gdp_c + years_edu_c + 
+                                                      life_exp_c + income_class +
+                                                      year_c + region +
+                                                      ln_gdp_c: years_edu_c +
+                                                      ln_gdp_c: life_exp_c +
+                                                      ln_gdp_c: income_class +
+                                                      ln_gdp_c: year_c +
+                                                      ln_gdp_c: region,
+                                                      data = sdg)
+#creates a linear model with main effects and all two way interactions
+combinations <- dredge(global_linear_log_model, rank = AIC)
+#coefTable(combinations[1])
+best_linear_log_model <- lm(infant_mortality_rate ~ ln_gdp_c + years_edu_c + 
+                                                  life_exp_c + income_class +
+                                                  year_c + region +
+                                                  ln_gdp_c: years_edu_c +
+                                                  ln_gdp_c: life_exp_c +
+                                                  ln_gdp_c: income_class +
+                                                  ln_gdp_c: region,
+                                                  data = sdg)
+
+coefs_bllm <- tidy(best_linear_log_model)
+comp_aic_lin_log = AIC(best_linear_log_model)
+```
+```{r q1 - Best Linear SR Model}
+#conversion to square root gdp
+sdg <- sdg %>% mutate(sr_gdp = sqrt(gdp))
+sdg <- sdg %>% mutate(sr_gdp_c = sr_gdp - mean(sdg$sr_gdp))
+
+global_linear_sr_model <- lm(infant_mortality_rate ~ sr_gdp_c + years_edu_c + 
+                                                     life_exp_c + income_class +
+                                                     year_c + region +
+                                                     sr_gdp_c: years_edu_c +
+                                                     sr_gdp_c: life_exp_c +
+                                                     sr_gdp_c: income_class +
+                                                     sr_gdp_c: year_c +
+                                                     sr_gdp_c: region,
+                                                     data = sdg)
+#creates a linear model with main effects and all two way interactions
+combinations <- dredge(global_linear_sr_model, rank = AIC)
+#coefTable(combinations[1])
+best_linear_sr_model <- lm(infant_mortality_rate ~ sr_gdp_c + years_edu_c + 
+                                                  life_exp_c + income_class +
+                                                  year_c + region +
+                                                  sr_gdp_c: years_edu_c +
+                                                  sr_gdp_c: life_exp_c +
+                                                  sr_gdp_c: region,
+                                                  data = sdg)
+coefs_blsm <- tidy(best_linear_sr_model)
+```
+
+```{r q1 - Comparing AICs}
+AIC_comparison <- AIC(best_linear_model, 
+                      best_linear_log_model, 
+                      best_linear_sr_model)
+#creates the AIC comparison table
+rownames(AIC_comparison) <- c("Linear GDP Model", 
+                              "Log GDP Model", 
+                              "Square-root GDP Model")
+kbl(AIC_comparison, booktabs = T, 
+    caption = "AIC Comparison: Transformations of GDP",
+    digits = 2) %>% 
+      kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+
+I then searched for the best model with log and square root transformations of GDP per capita through a similar method, as these transformations had a better linear association with GDP per capita based on the exploratory analysis. From the table above, it was clear that the log transformation of GDP had the best model fit by AIC.
+
+However, the issue with all the models above is that they assume independent observations. This is problematic, as these observations are inherently associated as they have been taken from the same country, and observations from a country at one point in time are not independent of observations in a different point in time. One way to account for this lack of independence is to incorporate mixed effect models that model both fixed and random effects to account for the grouping structure inherent to this data. The random effects capture country to country variability in the infant mortality rate, whereas the fixed effects capture variability within the countries over time. 
+
+The new linear model with random effects is expressed as:
+$$E[\mbox{infant mortality rate}|\mbox{gdp, years education, life expectancy, year, income class, region, country}] =$$ $$\alpha_0 + b_{country} + \alpha_1 \mbox{log}(\mbox{gdp}) + \alpha_2\, \mbox{years education} +  \alpha_3\, \mbox{life expectancy} +  \alpha_4\, \mbox{year} +\vec\beta\, \mbox{income class} + \vec\gamma \mbox{region}\ +$$ $$ \delta_1\ \mbox{log}(\mbox{gdp})*\mbox{life expectancy} + \delta_2\ \mbox{log}(\mbox{gdp})*\mbox{years education} + \delta_3\ \mbox{log}(\mbox{gdp})*\mbox{year}\, +$$  $$\vec\epsilon \mbox{log}(\mbox{gdp})*\mbox{income class} + \vec\zeta \mbox{log}(\mbox{gdp})*\mbox{region} $$
+
+Where $b_{country}$ represents the random effect of a given country in it's intercept, allowing the mean of he infant mortality rate to vary based on country. The motivation for incorporating random effects as opposed to fixed effects for each country is that random effects are more efficient, using fewer parameters as only one additional parameter, $\sigma^2_{country}$ is required as opposed to a fixed effect for each country, which would increase the number of parameters to be estimated by 88. The below plot shows the estimates of the random effects and fixed effects, demonstrating that these random effects largely capture the same trend as fixed effects, but are a more efficient estimator.
+
+```{r q1 - random effect plot}
+#simple possible model with random intercepts
+mod_int <- lmer(infant_mortality_rate ~ 1 + (1|country) + year_c, sdg)
+
+#creating fixed effects
+grand_mean <- mean(sdg$infant_mortality_rate)
+gap_mean <- 
+  sdg %>% 
+    group_by(country) %>% 
+      summarise(infant_mortality_rate = mean (infant_mortality_rate))
+
+re_int <-  
+  ranef(mod_int) %>% 
+    as_tibble() %>% 
+      bind_cols(fixed=gap_mean$infant_mortality_rate-grand_mean)
+
+wedge = mean(re_int$fixed)
+re_int <- 
+  re_int %>% 
+    mutate(fixed = fixed - wedge)
+
+#mean(re_int$condval)
+#mean(re_int$fixed)
+re_int %>% 
+  ggplot(aes(y   = grp,
+             x   = condval,
+             col = "Random")) +
+      geom_point(size = 0.5) +
+          geom_point(aes(x   = fixed, 
+                         y   = grp,
+                         col = "Fixed"),
+                     alpha=0.4) +
+            labs(x   = "Infant Mortality Rate", 
+                 y   = "Country",
+                 col = "Effect") +
+   guides(y = guide_axis(check.overlap = TRUE))
+```
+
+A limitation of the random effects is that they are by construction assumed to be normally distributed, however this plot indicates that these random effects are unlikely to originate from a normal distribution, as there is clear evidence of a right skewed distribution. 
+
+When adding random effects into the model, the variance of the infant mortality rate is decomposed into variance across countries and variance within countries. The fixed effect of the intercept now estimates the grand mean of life expectancy, and the random effects represent deviations from this mean with variance $\sigma^2_{country}$. $$\mbox{Var(infant mortality rate)} = \sigma^2_{country}+\sigma^2_{residual}$$ The random effects therefore capture the variability across countries, and the below hypothesis test checks whether the variance across countries is greater than zero: $$\mbox{H}_0:\,\sigma^2_{country}=0 \qquad \mbox{vs} \qquad \mbox{H}_1:\sigma^2_{country}\neq0$$
+```{r q1 - testing country random effects}
+
+added_country_effects <- lmer(infant_mortality_rate ~ ln_gdp_c + years_edu_c + life_exp_c + 
+    income_class + year_c + region + ln_gdp_c:years_edu_c + ln_gdp_c:life_exp_c + 
+    ln_gdp_c:income_class + ln_gdp_c:region + (1| country), REML = FALSE, data = sdg)
+
+anova(added_country_effects, best_linear_log_model) %>% 
+  pander(caption = "Hypothesis Test")
+```
+
+From this hypothesis test it is clear that the variance between countries is not 0, and grouping by country is beneficial to the model. Modelling region as a series of fixed effects is also inefficient, and region should therefore be modelled as a random effect.
+
+The new linear model including region random effects can be represented as:$$E[\mbox{infant mortality rate}|\mbox{gdp, years education, life expectancy, year, income class, region, country}] =$$ $$\alpha_0 + b_{country} + c_{region} +\alpha_1 \mbox{gdp} + \alpha_2\, \mbox{years education} +  \alpha_3\, \mbox{life expectancy} +  \alpha_4\, \mbox{year} +\vec\beta\, \mbox{income class}\, + $$ $$ \delta_1\ \mbox{gdp*life expectancy} + \delta_2\ \mbox{gdp*years education} + \delta_3\ \mbox{gdp*year} +  \vec\epsilon \mbox{gdp*income class} $$
+
+Now the variance is decomposed into variance across regions, variance across countries and variance within countries. $$\mbox{Var(infant mortality rate)} = \sigma^2_{country}+\sigma^2_{region}+\sigma^2_{residual}$$ The random effects capture the variability across countries and regions. The below hypothesis test tests whether the variance across regions is greater than 0: $$\mbox{H}_0:\,\sigma^2_{region}=0 \qquad \mbox{vs} \qquad \mbox{H}_1:\sigma^2_{region}\neq0$$
+
+```{r q1 - testing region random effects}
+country_random_effects <- lmer(infant_mortality_rate ~ ln_gdp_c + years_edu_c + life_exp_c + 
+    income_class + year_c + ln_gdp_c:years_edu_c + ln_gdp_c:life_exp_c + 
+    ln_gdp_c:income_class + (1| country), REML = FALSE, data = sdg)
+  
+country_and_region_random_effects<- lmer(infant_mortality_rate ~ ln_gdp_c + years_edu_c + life_exp_c + 
+    income_class + year_c + ln_gdp_c:years_edu_c + ln_gdp_c:life_exp_c + 
+    ln_gdp_c:income_class + (1| country) + (1|region), REML = FALSE, data = sdg)
+
+anova(country_and_region_random_effects, country_random_effects) %>% 
+  pander(caption = "Hypothesis Test")
+```
+
+This hypothesis test suggests that variance across regions is also greater than 0, and regional random effects should be included in the model. As a result, I again searched for the best model by AIC after incorporating region and country random effects into the model, this time using stepwise regression as searching through every model is poorly supported in R with mixed models, and the runtime became extortionate. Stepwise regression, unlike brute force exhaustive search, is not guaranteed to find the best model from a set of candidate predictors. As a result, I ran both forward and backward stepwise regressions, and the results were identical in both cases, implying that it is likely the best model was found. The best linear model can be shown as:
+
+```{r q1 - stepwise regression for linear model}
+#specifying global model
+global_linear_heir_re_model <- lmer(infant_mortality_rate ~ ln_gdp_c + years_edu_c + life_exp_c + 
+    income_class + year_c + ln_gdp_c:years_edu_c + ln_gdp_c:life_exp_c + 
+    ln_gdp_c:income_class + ln_gdp_c:year_c + (1| country) + (1 | region), data = sdg)
+
+#implementing stepwise regression
+best_lin_heir_re_model_f <- step(global_linear_heir_re_model, direction = "forward")
+best_lin_heir_re_model_b <- step(global_linear_heir_re_model, direction = "backward")
+best_lin_fmla <- infant_mortality_rate ~ ln_gdp_c + life_exp_c + income_class + 
+                    year_c + (1 | country) + (1 | region) + 
+                    ln_gdp_c:life_exp_c + ln_gdp_c:income_class + ln_gdp_c:year_c
+
+#expressing best model
+best_lin_model <- lmer(best_lin_fmla, data = sdg)
+```
+$$E[\mbox{infant mortality rate}|\mbox{gdp, years education, life expectancy, year, income class, region, country}] =$$ $$\alpha_0 + b_{country} + c_{region} + \alpha_1 \mbox{log}(\mbox{gdp}) +  \alpha_2\, \mbox{life expectancy} +  \alpha_3\, \mbox{year} +\vec\beta\, \mbox{income class}\, + $$ $$ \delta_1\ \mbox{log}(\mbox{gdp})*\mbox{life expectancy} + \delta_2\ \mbox{log}(\mbox{gdp})*\mbox{year} +  \vec\epsilon \mbox{log}(\mbox{gdp})*\mbox{income class} $$
+
+```{r q1 - qqplot, fig.width=6,fig.height=3, fig.align='center'}
+diagnostics1 <-
+  data.frame(residuals   = residuals(best_lin_model),
+             fitted_vals = fitted(best_lin_model),
+             country     = sdg$country) 
+
+ordered_contry<-sdg$country[order(diagnostics1$residuals)]
+
+diagnostics1 %>%
+  ggplot(aes(sample = residuals))+ 
+    stat_qq() + 
+      stat_qq_line()+
+        geom_text(label=ordered_contry,
+                  stat="qq",
+                  check_overlap = T) +
+      labs(y= "Residuals",
+           x= "Theoretical",
+           title = "QQ Plot - Residuals of Linear Mixed Model")
+```
+
+After determining on the best linear model, I constructed a qq plot to determine how reasonable the assumption of normality of the residuals was. Unfortunately, the plot suggests that the assumption of normally distributed residuals is in doubt, as the distribution of the residuals is more heavy-tailed than a normal distribution. As a result, a transformed linear model with a concave transformation is likely to be appropriate. I considered square root and natural log transformations of the dependant variable for interpretability, and again searched for the best nested model by stepwise regression for both the log transformed and square root transformations of the dependent variable.
+
+```{r q1 - Stepwise transformed log regression}
+#creating global model
+global_log_log_model <- lmer(log(infant_mortality_rate) ~ ln_gdp_c + years_edu_c + life_exp_c + 
+    income_class + year_c + ln_gdp_c:years_edu_c + ln_gdp_c:life_exp_c + 
+    ln_gdp_c:income_class + ln_gdp_c:year_c + (1| country) + (1 | region), data = sdg)
+
+#performing stepwise regression
+best_log_heir_re_model_f <- step(global_log_log_model, direction = "forward")
+best_log_heir_re_model_b <- step(global_log_log_model, direction = "backward")
+best_log_fmla <- log(infant_mortality_rate) ~ ln_gdp_c + years_edu_c + 
+                  life_exp_c + income_class + year_c + (1 | country) + 
+                  (1 | region) + ln_gdp_c:life_exp_c + ln_gdp_c:income_class
+
+#expressing best model
+best_log_log_model <- lmer(best_log_fmla, data = sdg)
+```
+
+
+```{r q1 - stepwise transformed log regression}
+#creating global model
+global_sr_log_model <- lmer(sqrt(infant_mortality_rate) ~ ln_gdp_c + years_edu_c + life_exp_c + 
+    income_class + year_c + ln_gdp_c:years_edu_c + ln_gdp_c:life_exp_c + 
+    ln_gdp_c:income_class + ln_gdp_c:year_c + (1| country) + (1 | region), data = sdg)
+#performing stepwise regression
+best_sr_heir_re_model_f <- step(global_sr_log_model, direction = "forward")
+best_sr_heir_re_model_b <- step(global_sr_log_model, direction = "backward")
+best_sr_fmla <- sqrt(infant_mortality_rate) ~ ln_gdp_c + years_edu_c + 
+                  life_exp_c + income_class + year_c + (1 | country) + 
+                  (1 | region) + ln_gdp_c:income_class + ln_gdp_c:year_c
+
+#expressing best model
+best_sr_log_model <- lmer(best_sr_fmla, data = sdg)
+```
+
+
+```{r q1 AIC comparison 2}
+AIC_comparison <- data.frame(df = c(15, 15, 15),
+                             AIC = c(AIC(best_lin_model),
+                                     AIC(best_log_log_model) + 
+                                     sum(2*log(sdg$infant_mortality_rate)),
+                                     AIC(best_sr_log_model) - 
+                                     2*sum(log(1/(2*(sdg$infant_mortality_rate)**0.5)))))
+
+rownames(AIC_comparison) <- c("Linear Model", "Log Transformed Linear Model", "Square Root Model")
+kbl(AIC_comparison, booktabs = T, 
+    caption = "AIC Comparison: Transformed Linear Models",
+    digits = 2) %>% 
+      kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+
+It was clear from this that the best transformed linear model was a model with both a log transformation of GDP per capita and a log transformation of infant mortality rate, as this model had the lowest Akaike Information Criterion, implying it was the simplest transformed linear model that accurately modelled the underlying data. The QQ plot for this model was much less heavy tailed, implying that this transformation reduced the issue of non-normally distributed residuals.
+
+```{r q1 - second qq plot, echo = FALSE}
+diagnostics2 <-
+  data.frame(residuals   = residuals(best_log_log_model),
+             fitted_vals = fitted(best_log_log_model),
+             country     = sdg$country) 
+
+ordered_contry<-sdg$country[order(diagnostics2$residuals)]
+
+plot <- diagnostics2 %>%
+  ggplot(aes(sample = residuals))+ 
+    stat_qq() + 
+      stat_qq_line()+
+        geom_text(label=ordered_contry,
+                  stat="qq",
+                  check_overlap = T) +
+      labs(y= "residuals",
+           title = "Best Log Transformed Model (Residuals)")
+```
+
+The specification of this log transformed linear model is as below:
+
+$$E[\mbox{log(infant mortality rate)}|\mbox{gdp, years education, life expectancy, region, country}] =$$ $$\beta_0 + b_{country} + c_{region} + \beta_1 \mbox{log}(\mbox{gdp}) + \beta_2\, \mbox{years education} +  \beta_3\, \mbox{life expectancy}\, +$$ $$\vec{\gamma} \mbox{income class} + \vec{\delta}\mbox{log}(\mbox{gdp})*\mbox{income class}$$
+```{r q1 - presenting best TLM}
+summary(best_log_log_model)$coefficients %>% 
+  kable(digits = 3, caption = "Best Log Transformed Mixed Linear Model")  %>% 
+  kable_styling(latex_options = c("striped"))
+```
+This model suggests that for a 1% increase in GDP per capita, the average infant mortality rate falls by 0.22% within a low income country. However, as the income class increases, the effect of GDP per capita on life expectancy is diminished, such that when the income class is high income, the effect of increasing GDP per capita by 1% increases the expected infant mortality rate by 0.03%. These effects can be shown in the plot below.
+
+```{r q1 - effect plot 1, fig.width=6,fig.height=3, fig.align='center'}
+gdp_1 <- 
+  sdg %>% 
+    data_grid(ln_gdp_c = seq_range(ln_gdp_c, 100),
+              life_exp_c = 0, 
+              years_edu_c = 0,
+              year_c = 0,
+              income_class = "L")
+gdp_2 <- 
+  sdg %>% 
+    data_grid(ln_gdp_c = seq_range(ln_gdp_c, 100),
+              life_exp_c = 0, 
+              years_edu_c = 0,
+              year_c = 0,
+              income_class = "LM")
+
+gdp_3 <- 
+  sdg %>% 
+    data_grid(ln_gdp_c = seq_range(ln_gdp_c, 100),
+              life_exp_c = 0, 
+              years_edu_c = 0,
+              year_c = 0,
+              income_class = "UM")
+
+gdp_4 <- 
+  sdg %>% 
+    data_grid(ln_gdp_c = seq_range(ln_gdp_c, 100),
+              life_exp_c = 0, 
+              years_edu_c = 0,
+              year_c = 0,
+              income_class = "H")
+
+pred1 <- 
+  predict(best_log_log_model, 
+          newdata = gdp_1,
+          type = "response",
+          re.form = NA)
+
+pred2 <- 
+  predict(best_log_log_model, 
+          newdata = gdp_2,
+          type = "response",
+          re.form = NA)
+
+pred3 <- 
+  predict(best_log_log_model, 
+          newdata = gdp_3,
+          type = "response",
+          re.form = NA)
+
+pred4 <- 
+  predict(best_log_log_model, 
+          newdata = gdp_4,
+          type = "response",
+          re.form = NA)
+
+gdp <- 
+  gdp_1 %>% 
+  bind_cols(pred1 = pred1, pred2 = pred2, pred3 = pred3, pred4 = pred4) %>% 
+    mutate(ngdp = exp(ln_gdp_c + mean(sdg$ln_gdp)))
+
+fig <- 
+  gdp %>% 
+  ggplot() +
+  geom_line(aes(ngdp, pred1, col = "Low Income")) +
+  geom_line(aes(ngdp, pred2, col = "Lower Middle Income")) +
+  geom_line(aes(ngdp, pred3, col = "Upper Middle Income")) +
+  geom_line(aes(ngdp, pred4, col = "High Income")) +
+  labs(col = "Income Class", title = "GDP effect by income class") +
+  ylab("Infant Mortality Rate") + 
+  xlab("GDP per capita")
+
+fig
+
+```
+
+An alternative to transformed linear models is to use generalised linear models (glms). The motivation for this is that truly, infant mortality rate is not normally distributed, as it cannot lie below zero. A gamma glm with a log link is the natural choice, as this distribution better reflects continuous data that cannot fall below zero.
+
+```{r q1 - By Hand Stepwise}
+fmla_0 <- infant_mortality_rate ~ ln_gdp_c + years_edu_c + 
+                                    life_exp_c + income_class +
+                                    year_c +
+                                    ln_gdp_c: years_edu_c +
+                                    ln_gdp_c: life_exp_c +
+                                    ln_gdp_c: income_class +
+                                    ln_gdp_c: year_c +
+                                    (1 | country) +
+                                    (1 | region)
+
+gamma_model_0 <- glmer(formula <- fmla_0,
+                              data = sdg, 
+                              family = "Gamma"(link = "log"))
+
+#as the stepwise regression doesn't work, implemented the stepwise regression by hand
+#drop1(gamma_model_0)
+#drop interaction between income class and gdp
+fmla_1 <- infant_mortality_rate ~ ln_gdp_c + years_edu_c + 
+                                    life_exp_c + income_class +
+                                    year_c +
+                                    ln_gdp_c: years_edu_c +
+                                    ln_gdp_c: life_exp_c +
+                                    ln_gdp_c: year_c +
+                                    (1 | country) +
+                                    (1 | region)
+
+gamma_model_1 <- glmer(formula <- fmla_1,
+                              data = sdg, 
+                              family = "Gamma"(link = "log"))
+#drop1(gamma_model_1)
+#drop income_class
+fmla_2 <- infant_mortality_rate ~ ln_gdp_c + years_edu_c + 
+                                    life_exp_c +
+                                    year_c +
+                                    ln_gdp_c: years_edu_c +
+                                    ln_gdp_c: life_exp_c +
+                                    ln_gdp_c: year_c +
+                                    (1 | country) +
+                                    (1 | region)
+
+gamma_model_2 <- glmer(formula <- fmla_2,
+                              data = sdg, 
+                              family = "Gamma"(link = "log"))
+
+#drop1(gamma_model_2)
+
+fmla_3 <- infant_mortality_rate ~ ln_gdp_c + years_edu_c + 
+                                    life_exp_c +
+                                    ln_gdp_c: years_edu_c +
+                                    ln_gdp_c: life_exp_c +
+                                    (1 | country) +
+                                    (1 | region)
+
+gamma_model_3 <- glmer(formula <- fmla_3,
+                              data = sdg, 
+                              family = "Gamma"(link = "log"))
+
+#drop1(gamma_model_3)
+best_gamma_model <- gamma_model_3
+```
+
+This best fitting gamma glm can be expressed as:
+
+$$ \mbox{log}(E[\mbox{infant mortality rate}|\mbox{gdp, years education, life expectancy, region, country}]) =$$ $$\alpha_0 + b_{country} + c_{region} + \alpha_1 \mbox{log}(\mbox{gdp}) + \alpha_2\, \mbox{years education} +  \alpha_3\, \mbox{life expectancy}\, +$$ $$\alpha_4 \mbox{log}(\mbox{gdp})*\mbox{years education} +\alpha_5 \mbox{log}(\mbox{gdp})*\mbox{life expectancy}$$
+
+```{r q1 - presenting best GLM}
+summary(best_gamma_model)$coefficients %>% 
+  kable(digits = 3, caption = "Best Gamma Mixed Model") %>% 
+  kable_styling(latex_options = c("striped"))
+```
+
+This model's estimate gives the surprising result that at the average level of years of education and life expectancy, increasing GDP per capita increases the infant mortality in a country. This is likely due to confounding of other variables such as the average years of education in a country, that are highly correlated with both GDP per capita and the infant mortality rate. As shown in the effect plots below, it can be seen that the effect of GDP per capita is much more substantial at low levels of life expectancy and higher levels of education.
+
+```{r q1 - effect plot 2, fig.width=6,fig.height=3, fig.align='center'}
+
+#quantile(sdg$life_expectancy)
+#quantile(sdg$years_education)
+gdp_1 <- 
+  sdg %>% 
+    data_grid(ln_gdp_c = seq_range(ln_gdp_c, 100),
+              life_exp_c = -1.9, 
+              years_edu_c = -1.6)
+gdp_2 <- 
+  sdg %>% 
+    data_grid(ln_gdp_c = seq_range(ln_gdp_c, 100),
+              life_exp_c = 5.2, 
+              years_edu_c = -1.6)
+
+gdp_3 <- 
+  sdg %>% 
+    data_grid(ln_gdp_c = seq_range(ln_gdp_c, 100),
+              life_exp_c = -1.9, 
+              years_edu_c = 2.2)
+
+gdp_4 <- 
+  sdg %>% 
+    data_grid(ln_gdp_c = seq_range(ln_gdp_c, 100),
+              life_exp_c = 5.2, 
+              years_edu_c = 2.2)
+
+pred1 <- 
+  predict(best_gamma_model, 
+          newdata = gdp_1,
+          type = "response",
+          re.form = NA)
+
+pred2 <- 
+  predict(best_gamma_model, 
+          newdata = gdp_2,
+          type = "response",
+          re.form = NA)
+
+pred3 <- 
+  predict(best_gamma_model, 
+          newdata = gdp_3,
+          type = "response",
+          re.form = NA)
+
+pred4 <- 
+  predict(best_gamma_model, 
+          newdata = gdp_4,
+          type = "response",
+          re.form = NA)
+
+gdp <- 
+  gdp_1 %>% 
+  bind_cols(pred1 = pred1, pred2 = pred2, pred3 = pred3, pred4 = pred4) %>% 
+    mutate(ngdp = exp(ln_gdp_c + mean(sdg$ln_gdp)))
+
+g_low_life_exp <- 
+  gdp %>% 
+  ggplot() +
+  geom_line(aes(ngdp, pred1, col = "Low Life Expectancy")) +
+  geom_line(aes(ngdp, pred2, col = "High Life Expectancy")) + 
+  labs(col = "Life Expectancy", title = "Low Education") +
+  ylab("Infant Mortality Rate") + 
+  xlab("GDP per capita")
+
+g_high_life_exp <- 
+  gdp %>% 
+  ggplot() +
+  geom_line(aes(ngdp, pred3, col = "Low Life Expectancy")) +
+  geom_line(aes(ngdp, pred4, col = "High Life Expectancy")) + 
+  labs(col = "Life Expectancy", title = "High Education") +
+  ylab("Infant Mortality Rate") + 
+  xlab("GDP per capita")
+
+g_low_life_exp 
+g_high_life_exp
+
+```
+
+
+## Model diagnostics
+
+```{r q1 - Residual Plot, fig.width=6,fig.height=3, fig.align='center'}
+#creating the data
+diagnostics_1 <-
+  data.frame(residuals   = residuals(best_lin_model),
+             fitted_vals = fitted(best_lin_model),
+             observed = sdg$infant_mortality_rate,
+             country     = sdg$country,
+             model = "Linear Mixed Model") 
+
+diagnostics_2 <- 
+  data.frame(fitted_vals = exp(fitted(best_log_log_model)),
+             observed = sdg$infant_mortality_rate,
+             country = sdg$country,
+             model = "Transformed Linear Mixed Model") %>% 
+               mutate(residuals = observed - fitted_vals)
+
+diagnostics_3 <- 
+  data.frame(fitted_vals = fitted(best_gamma_model),
+             observed = sdg$infant_mortality_rate,
+             country = sdg$country,
+             model = "Gamma Mixed Model") %>% 
+               mutate(residuals = observed - fitted_vals)
+
+diagnostics <- rbind(diagnostics_1, diagnostics_2, diagnostics_3)
+diagnostics <-
+  diagnostics %>% 
+    mutate(model = as.factor(model))
+
+#diagnostic plot
+fit_vs_res<-
+  diagnostics%>%
+      ggplot(aes(fitted_vals, residuals)) + 
+        geom_point() +
+          geom_abline(intercept = 0, 
+                      slope = 0, 
+                      col = "red")  + 
+            geom_smooth() + 
+                ggtitle("Fitted Values vs Residuals") +
+                xlab("Infant Mortality Rate") + 
+                ylab("Residuals") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  ylim(c(-3,3)) +
+  facet_wrap(~model)
+#plotting
+
+fit_vs_res
+```
+
+
+This plot of fitted values against the residuals shows a clear trend in the residuals for the gamma mixed model. There should not be a trend in the residuals, as they should be randomly distributed with mean zero and constant variance, and be independent of one another. This suggests that the gamma mixed model is a poor choice for this data. As a result, the transformed linear mixed model is likely to be the best fit to the data, as the residuals shown no clear trend and the AIC is lower than the linear mixed model.
+
+## Conclusion
+
+Overall, it appears that an increase in GDP per capita has a clear and significant negative effect on infant mortality when fitting a log transformed linear model, and this effect is reduced for high income countries.
+
+
+#  Q2. Does the type of coffee bean grown affect growth in coffee production within countries?
+
+## Introduction
+
+This question is motivated with understanding how different nations' coffee industries grow over time. This is an interesting question for economic development, as climate change and other factors alter the variety of coffee beans different nations can grow. It is plausible that the kind of coffee bean (arabica or robusta) has an impact on the development of a nation's coffee industry.
+
+## Data manipulation
+
+```{r q2 - Data Reading and Manipulation}
+#reading the data and converting to factors
+coffee_production <- read_csv("coffee.csv")
+coffee_production <- coffee_production %>% mutate(country = as.factor(country),
+                             arabica_robusta = as.factor(arabica_robusta))
+
+#this dataframe lets me see the number of missing values by variable.
+#I have not chosen to display it as I did last time and I don't see the value really
+filter_df <-colSums(is.na(coffee_production)) %>% as.matrix() %>% 
+                as.data.frame()
+
+#removing missing values of arabica_robusta (the groups, they seem like data aggregation so not relevant to analysis)
+coffee_production <- coffee_production[complete.cases(coffee_production[, 1:2]), ]
+
+#converting data from wide to long form
+coffee_production_long <- gather(coffee_production, year, bags, "1990":"2018")
+coffee_production_long <- coffee_production_long %>% 
+                            mutate(year = as.double(year),
+                                   country = as.factor(country),
+                                   arabica_robusta = as.factor(arabica_robusta))
+
+#creating a copies of this for later
+coffee_production_long_p <- data.frame(coffee_production_long)
+coffee_production_long_c <- data.frame(coffee_production_long)
+
+#adding 1 to have non-zeroes
+coffee_production_long <- coffee_production_long %>% 
+                            mutate(bags = bags + 1)
+
+#creating a growth rate for plotting purposes
+coffee_production_long <- coffee_production_long %>% 
+  dplyr::select(country, arabica_robusta, year, bags) %>%
+  group_by(country) %>%
+  mutate(growth = c(NA,diff(bags))/lag(bags, 1))
+
+#consistently recoding missing values
+coffee_production_long[coffee_production_long == Inf] <- NA
+coffee_production_long[coffee_production_long == NaN] <- NA
+
+#ensuring there are no missing values in the variables used
+coffee_production_long <- 
+  coffee_production_long[complete.cases(coffee_production_long[, 1:4]),]
+
+#checking for country imbalance
+missing_countries <- coffee_production_long %>% 
+                      group_by(country) %>% 
+                      summarise(n = n())
+
+#centring year
+coffee_production_long <- coffee_production_long %>% 
+                            mutate(year_c = year - 2004)
+
+#making levels look nice
+levels(coffee_production_long$arabica_robusta) <- c("Arabica", "Arabica/ Robusta", "Robusta", "Robusta/ Arabica")
+
+```
+
+Before any analysis can begin, some data manipulation was required. This included removing the three aggregate groups in the data (July, August, October) based on when the data was collected as these are not meaningful for the analysis. It was also necessary to convert this data from it's wide form, where each year was reflected by a separate column, to it's long form, where there is an indicator variable for the year, in order to fit linear models in R. As the intention is to log transform this data, I added 1 to all the total coffee production data in order to enable a log transformation of all the data.
+
+## Analysis
+
+```{r q2 - explanatory plot}
+
+scaleFUN <- function(x) sprintf("%.0f", x)
+coffee_production_long %>% 
+  ggplot(aes(year, bags, group = country)) +
+  geom_line() + facet_wrap(~arabica_robusta) +
+  ylab("Thousand 60kg bags of coffee: Log scale") +
+  scale_y_continuous(trans = "log", labels = scaleFUN) +
+  xlab("Year") + 
+  geom_vline(xintercept = 2004, col = "red", alpha=0.5)
+```
+
+This plot shows the time trend of total coffee production for each country in thousand 60kg bags. Each country is split by the primary bean produced, and it is clear from this plot that there is a great heterogeneity in both the trends and starting points of coffee production in each country, irrespective of the bean produced.
+
+The simplest model to reflect this data is a transformed linear model with no random effects, reflected by the model:
+
+$$E[\mbox{log(bags)}|\mbox{year, bean}] =$$ $$\alpha_0 + \alpha_1 \mbox{ArabicaRobusta} + \alpha_2\, \mbox{RobustaArabica} +  \alpha_3\, \mbox{Robusta} + $$ $$\alpha_4\, \mbox{year} + \alpha_5\, \mbox{year*ArabicaRobusta} + \alpha_6\, \mbox{year*RobustaArabica} + \alpha_7\, \mbox{year*Robusta}$$
+
+Where $100(e^{\alpha_1}-1)$  captures the expected percent change in coffee production in the year 2004 when the primary bean is Arabica Robusta compared to Arabica. $\alpha_2$ and $\alpha_3$ have similar interpretations. $100(e^{\alpha_4}-1)$ captures the growth rate in coffee production when the year increases by one year. $e^{\alpha_5}$ represents the additional growth rate in coffee production for Arabica Robusta compared to Arabica when the year increases. $\alpha_6$ and $\alpha_7$ have similar interpretations to $\alpha_5$. The question we are interested in is whether the growth rate of a country's coffee industry is different for countries with different coffee beans, and this is equivalent to performing the hypothesis test:
+
+$$H_0\,: \alpha_5 = \alpha_6 = \alpha_7 = 0 \qquad \mbox{vs}\qquad H_1\> : \exists \> \alpha_i \not =0 \>\mbox{for} \>i \in \mbox{{5, 6, 7}} $$
+```{r q2 - hypotheses test}
+constant_slopes_by_bean <- lm(log(bags) ~ arabica_robusta + year_c, coffee_production_long)
+differing_slopes_by_bean <- lm(log(bags) ~ arabica_robusta + year_c + year_c:arabica_robusta, coffee_production_long)
+
+anova(constant_slopes_by_bean, differing_slopes_by_bean) %>%
+  pander(caption = "Hypothesis Test")
+```
+
+This hypothesis test shows that, using this simplified model, there is no evidence of the type of bean affecting the growth rate of a countries coffee production. Visually, the current model predictions show that the growth rate of coffee industry is independent of the primary coffee bean grown, as the fitted lines are parallel for each coffee bean.
+
+```{r q2 - prediction plot}
+coffee_production_long %>% add_predictions(constant_slopes_by_bean) %>% mutate(pred = exp(pred)) %>% 
+  ggplot(aes(year, pred, group = country)) +
+  geom_line(alpha = 0.2, col = "blue")  +
+  geom_line(aes(year, bags, group = country), alpha = 0.2) +
+  ylab("Thousand 60kg bags of coffee: Log scale") +
+  scale_y_continuous(trans = "log", labels = scaleFUN) +
+  xlab("Year") +
+  facet_wrap(~arabica_robusta) + 
+  geom_vline(xintercept = 2004, col = "red", alpha=0.5)
+```
+
+However, the simple transformed linear model is a poor fit to data. The prior transformed linear model assumes that the data is independent, but the observations are not independent as there is an inherent grouping by country. A better way to model this data incorporates mixed effect models to account for the inherent grouping by country. Fitting a model with random effects for each countries intercept and slope incorporates the fact that these countries coffee industries both start off at different sizes and grow at different rates over the time period as below:
+
+$$E[\mbox{log(bags)}|\mbox{year, bean}] =$$ $$\alpha_0 + b_{country} +\alpha_1 \mbox{ArabicaRobusta} + \alpha_2\, \mbox{RobustaArabica} +  \alpha_3\, \mbox{Robusta} + $$ $$\alpha_4 + (c_{country})\, \mbox{year} + \alpha_5\, \mbox{year*ArabicaRobusta} + \alpha_6\, \mbox{year*RobustaArabica} + \alpha_7\, \mbox{year*Robusta}$$
+
+Where $b_{country}$ reflects the random effects on the intercept and $c_{country}$ reflects random effects in the growth rates. This model therefore attributes country to country variability in both the growth rate of the countries coffee industry and the size of the coffee industry in 2004. This was important to model due to the observed heterogeneity in both the growth rate and size of the coffee industry in 2004. The below hypothesis test checks to see if the model with neither random intercepts nor slopes, the model with just random intercepts or the model with random intercepts and slopes is correct. As the p-value is very small for both tests, we can conclude that the best model is the one which incorporates random effects for both the slope and intercept.
+
+```{r q2 - hypotheses test 2}
+
+no_random_effects <- lm(log(bags) ~ arabica_robusta + year_c + year_c:arabica_robusta, coffee_production_long)
+random_intercepts <- lmer(log(bags) ~ arabica_robusta + year_c + year_c:arabica_robusta + (1 | country), REML = FALSE, coffee_production_long)
+random_intercepts_and_slopes <- lmer(log(bags) ~ arabica_robusta + year_c + year_c:arabica_robusta + (1 + year_c | country), REML = FALSE, coffee_production_long)
+
+anova(random_intercepts_and_slopes, random_intercepts, no_random_effects ) %>% 
+  pander(caption = "Hypothesis Test")
+```
+
+```{r q2 - prediction plot 2}
+coffee_production_long %>% add_predictions(random_intercepts_and_slopes) %>% 
+  mutate(pred = exp(pred)) %>% 
+  ggplot(aes(year, pred, group = country)) +
+  geom_line(alpha = 0.5, col = "blue")  +
+  geom_line(aes(year, bags, group = country), alpha = 0.2) +
+  ylab("Thousand 60kg bags of coffee: Log scale") +
+  scale_y_continuous(trans = "log", labels = scaleFUN) +
+  xlab("Year") +
+  facet_wrap(~arabica_robusta) + 
+  geom_vline(xintercept = 2004, col = "red", alpha=0.5)
+```
+
+These random effects capture deviations in the size of the coffee industry by country in 2004, as well as deviations in the growth of the coffee industry by country. The intercept random effects are approximately equal to deviations in the grand mean of the log of coffee production by country, as shown by the table below.
+
+```{r contrasts}
+aux_mod <- lm(log(bags) ~ country + year_c, 
+              data = coffee_production_long,
+              contrasts = list(country = "contr.sum"))
+contrasts <- append(coef(aux_mod)[2:56], sum(coef(aux_mod)[2:56]))
+
+aux_mod_2 <- lmer(log(bags) ~ year_c + (1 | country),
+                  data = coffee_production_long) 
+cbind(ranef(aux_mod_2)$country, contrasts) %>% 
+  head(.,10) %>% 
+  kbl(., booktabs = T, digits =2,
+    caption = "Data Points per Country; first 10 rows",
+    col.names = c("Intercept Random Effect", "Deviation")) %>% 
+  kable_styling(latex_options = c("striped", "HOLD_position"))
+  
+```
+
+After incorporating random effects into the model, we can again test whether or not the growth rates of a country's coffee industry are different based on the variety of coffee produced as below using the same hypothesis test.
+
+```{r q2 - hypothesis test 3}
+constant_fixed_slopes_by_bean <- lmer(log(bags) ~ arabica_robusta + year_c + (1 + year_c | country), data = coffee_production_long, REML = FALSE)
+varying_fixed_slopes_by_bean <- lmer(log(bags) ~ arabica_robusta + year_c + year_c:arabica_robusta + (1 + year_c | country), data = coffee_production_long, REML = FALSE)
+anova(varying_fixed_slopes_by_bean, constant_fixed_slopes_by_bean) %>% 
+  pander(caption = "Hypothesis Test")
+```
+
+This hypothesis test reveals that there is no substantial difference in the growth rates of a countries coffee industry by type of bean. One issue with the previous analysis is that the data was manipulated by adding one to the dependent variable such that a log transformation can be applied. To show the results were robust to this assumption, the below test was performed when the data where those observations where the dependent variable was 0 were dropped.
+
+```{r q2 - hypothesis test 4}
+#dropping the "missing values"
+coffee_production_long_p$bags[coffee_production_long_p$bags == 0] <- NA
+
+#repeating previous steps
+coffee_production_long_p <- 
+  coffee_production_long_p[complete.cases(coffee_production_long_p[, 1:4]),]
+
+#centring
+coffee_production_long_p <- coffee_production_long_p %>% 
+                            mutate(year_c = year - 2004)
+
+#making labels nicer
+levels(coffee_production_long_p$arabica_robusta) <- c("Arabica", "Arabica/ Robusta", "Robusta", "Robusta/ Arabica")
+
+constant_fixed_slopes_by_bean <- lmer(log(bags) ~ arabica_robusta + year_c + (1 + year_c | country), data = coffee_production_long_p, REML = FALSE)
+varying_fixed_slopes_by_bean <- lmer(log(bags) ~ arabica_robusta + year_c + year_c:arabica_robusta + (1 + year_c | country), data = coffee_production_long_p, REML = FALSE)
+anova(varying_fixed_slopes_by_bean, constant_fixed_slopes_by_bean) %>% 
+  pander(caption = "Hypothesis Test")
+```
+
+As shown, the p-value for the hypothesis test is almost identical, implying the means of handling cases where the dependent variable was 0 did not have a significant bearing on the results of the analysis.
+
+Another limitation is the choice of model. This data is truly count data, with the count being the thousands of coffee bags produced in a given year in a given country. As such, a poisson mixed glm would be a better fit for this data, as a poisson glm assumed the dependent variable follows a poisson distribution, whereas the transformed linear model above assumed the thousands of coffee bags produced by a country in a given year is normally distributed, which is not correct. Another benefit of modelling the data this way is there is no need to add one to the dependent variable, as this model uses the log of the expected value rather than the expected value of the log. However, modelling this data with a Poisson mixed model does not change the fundamental conclusion that the type of bean does not effect the growth rate of a country's coffee industry.
+
+```{r q2 - hypothesis test 5}
+#repeating previous steps
+coffee_production_long_c <- 
+  coffee_production_long_c[complete.cases(coffee_production_long_c[, 1:4]),]
+
+#centring
+coffee_production_long_c <- coffee_production_long_c %>% 
+                            mutate(year_c = year - 2004)
+
+#making labels nicer
+levels(coffee_production_long_p$arabica_robusta) <- c("Arabica", "Arabica/ Robusta", "Robusta", "Robusta/ Arabica")
+
+constant_fixed_slopes_by_bean <- glmer(bags ~ arabica_robusta + year_c + (1 + year_c | country), 
+                  data = coffee_production_long_c,
+                  family ="poisson"(link = "log"))
+varying_fixed_slopes_by_bean <- glmer(bags ~ arabica_robusta + year_c + year_c:arabica_robusta + (1 + year_c | country), 
+                       data = coffee_production_long_c,
+                       family = "poisson"(link = "log"))
+anova(varying_fixed_slopes_by_bean, constant_fixed_slopes_by_bean) %>% 
+  pander(caption = "Hypothesis Test")
+```
+## Conclusion
+
+Overall, this model concludes that there are not significantly different growth rates in a given country's coffee industry regardless of whether the primary bean is Arabica or Robusta.
+
