@@ -1057,5 +1057,5 @@ anova(varying_fixed_slopes_by_bean, constant_fixed_slopes_by_bean) %>%
 ```
 ## Conclusion
 
-Overall, this model concludes that there are not significantly different growth rates in a given country's coffee industry regardless of whether the primary bean is Arabica or Robusta.
+Overall, this model concludes that there are not significantly different growth rates in a given country's coffee industry regardless of whether the primary bean is Arabica or Robusta..
 
